@@ -1,0 +1,254 @@
+---
+- name: Deploy node app on EC2
+  hosts: all
+  become: yes
+  vars:
+    app_dir: /opt/app
+    app_port: 3000
+    node_version: "22"
+
+  tasks:
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Install required system packages
+      apt:
+        name:
+          - curl
+          - git
+          - nginx
+        state: present
+
+    - name: Install Node.js 22.x via NodeSource
+      shell: |
+        curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
+        apt-get install -y nodejs
+      args:
+        creates: /usr/bin/node
+
+    - name: Install PM2 globally
+      npm:
+        name: pm2
+        global: yes
+        state: present
+
+    - name: Create app directory
+      file:
+        path: "{{ app_dir }}"
+        state: directory
+        owner: ubuntu
+        group: ubuntu
+        mode: '0755'
+
+    - name: Pull app from GitHub
+      git:
+        repo: "https://github.com/{{ lookup('env', 'GITHUB_REPOSITORY') }}.git"
+        dest: "{{ app_dir }}"
+        version: HEAD
+        force: yes
+      environment:
+        GIT_TERMINAL_PROMPT: "0"
+      become: yes
+      become_user: ubuntu
+
+    - name: Install npm dependencies
+      npm:
+        path: "{{ app_dir }}"
+        state: present
+      become: yes
+      become_user: ubuntu
+
+    - name: Run build script if present
+      shell: |
+        if [ -f "package.json" ] && grep -q '"build"' "package.json"; then
+          npm run build
+        else
+          echo "No build script found, skipping."
+        fi
+      args:
+        chdir: "{{ app_dir }}"
+      become: yes
+      become_user: ubuntu
+
+    - name: Write /opt/app/.env using shell
+      shell: |
+        printf '' > /opt/app/.env
+        [ -n "{{ node_env_database_url | default('') }}" ] && echo "DATABASE_URL={{ node_env_database_url }}" >> /opt/app/.env || true
+        [ -n "{{ node_env_mongo_uri | default('') }}" ] && echo "MONGO_URI={{ node_env_mongo_uri }}" >> /opt/app/.env || true
+        [ -n "{{ node_env_db_host | default('') }}" ] && echo "DB_HOST={{ node_env_db_host }}" >> /opt/app/.env || true
+        [ -n "{{ node_env_db_port | default('') }}" ] && echo "DB_PORT={{ node_env_db_port }}" >> /opt/app/.env || true
+        [ -n "{{ node_env_db_name | default('') }}" ] && echo "DB_NAME={{ node_env_db_name }}" >> /opt/app/.env || true
+        [ -n "{{ node_env_db_user | default('') }}" ] && echo "DB_USER={{ node_env_db_user }}" >> /opt/app/.env || true
+        [ -n "{{ node_env_db_password | default('') }}" ] && echo "DB_PASSWORD={{ node_env_db_password }}" >> /opt/app/.env || true
+      args:
+        chdir: "{{ app_dir }}"
+
+    - name: Set ownership of app directory
+      file:
+        path: "{{ app_dir }}"
+        owner: ubuntu
+        group: ubuntu
+        recurse: yes
+
+    - name: Install PostgreSQL when requested
+      apt:
+        name: postgresql
+        state: present
+      when: install_db | default('false') == 'true' and db_type | default('') == 'postgres'
+
+    - name: Fix PostgreSQL SCRAM auth to md5
+      shell: |
+        PG_HBA=$(find /etc/postgresql -name pg_hba.conf | head -1)
+        sed -i 's/scram-sha-256/md5/g' "$PG_HBA"
+        systemctl reload postgresql
+      when: install_db | default('false') == 'true' and db_type | default('') == 'postgres'
+
+    - name: Create PostgreSQL database and user
+      shell: |
+        sudo -u postgres psql -tc "SELECT 1 FROM pg_database WHERE datname='{{ db_name }}'" | grep -q 1 || \
+          sudo -u postgres psql -c "CREATE DATABASE {{ db_name }};"
+        sudo -u postgres psql -tc "SELECT 1 FROM pg_roles WHERE rolname='{{ db_username }}'" | grep -q 1 || \
+          sudo -u postgres psql -c "CREATE USER {{ db_username }} WITH ENCRYPTED PASSWORD '{{ db_password }}';"
+        sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE {{ db_name }} TO {{ db_username }};"
+      when: install_db | default('false') == 'true' and db_type | default('') == 'postgres'
+
+    - name: Install MySQL when requested
+      apt:
+        name: mysql-server
+        state: present
+      when: install_db | default('false') == 'true' and db_type | default('') == 'mysql'
+
+    - name: Configure MySQL database and user
+      shell: |
+        mysql -e "CREATE DATABASE IF NOT EXISTS {{ db_name }};"
+        mysql -e "CREATE USER IF NOT EXISTS '{{ db_username }}'@'localhost' IDENTIFIED BY '{{ db_password }}';"
+        mysql -e "GRANT ALL ON {{ db_name }}.* TO '{{ db_username }}'@'localhost';"
+      when: install_db | default('false') == 'true' and db_type | default('') == 'mysql'
+
+    - name: Install MongoDB prerequisites
+      apt:
+        name:
+          - gnupg
+          - curl
+        state: present
+      when: install_db | default('false') == 'true' and db_type | default('') == 'mongodb'
+
+    - name: Install MongoDB when requested
+      shell: |
+        curl -fsSL https://www.mongodb.org/static/pgp/server-7.0.asc | gpg -o /usr/share/keyrings/mongodb-server-7.0.gpg --dearmor
+        echo "deb [ arch=amd64,arm64 signed-by=/usr/share/keyrings/mongodb-server-7.0.gpg ] https://repo.mongodb.org/apt/ubuntu jammy/mongodb-org/7.0 multiverse" \
+          > /etc/apt/sources.list.d/mongodb-org-7.0.list
+        apt-get update -y
+        apt-get install -y mongodb-org
+      args:
+        creates: /usr/bin/mongod
+      when: install_db | default('false') == 'true' and db_type | default('') == 'mongodb'
+
+    - name: Start and enable MongoDB
+      service:
+        name: mongod
+        state: started
+        enabled: yes
+      when: install_db | default('false') == 'true' and db_type | default('') == 'mongodb'
+
+    - name: Initialize MongoDB database
+      shell: |
+        mongosh --eval 'db.getSiblingDB("{{ db_name }}").createCollection("init")'
+      when: install_db | default('false') == 'true' and db_type | default('') == 'mongodb'
+
+    - name: Start app with PM2
+      shell: |
+        pm2 delete app 2>/dev/null || true
+        set -a
+        [ -f "{{ app_dir }}/.env" ] && . "{{ app_dir }}/.env"
+        export PORT="${PORT:-3000}"
+        export HOST="${HOST:-0.0.0.0}"
+        set +a
+        if [ -f "{{ app_dir }}/package.json" ] && grep -q '"start"' "{{ app_dir }}/package.json"; then
+          pm2 start npm --name app --update-env -- start
+        elif [ -f "{{ app_dir }}/server.js" ]; then
+          pm2 start "{{ app_dir }}/server.js" --name app --update-env
+        elif [ -f "{{ app_dir }}/index.js" ]; then
+          pm2 start "{{ app_dir }}/index.js" --name app --update-env
+        elif [ -f "{{ app_dir }}/app.js" ]; then
+          pm2 start "{{ app_dir }}/app.js" --name app --update-env
+        else
+          echo "No Node.js entrypoint found in {{ app_dir }}" >&2
+          exit 1
+        fi
+        pm2 save
+      args:
+        chdir: "{{ app_dir }}"
+      become: yes
+      become_user: ubuntu
+
+    - name: Install PM2 systemd startup service
+      shell: |
+        env PATH=$PATH:/usr/bin pm2 startup systemd -u ubuntu --hp /home/ubuntu
+      args:
+        creates: /etc/systemd/system/pm2-ubuntu.service
+
+    - name: Wait for app to be reachable on port 3000
+      wait_for:
+        host: 127.0.0.1
+        port: "{{ app_port }}"
+        delay: 10
+        timeout: 120
+        state: started
+      ignore_errors: yes
+      register: port_wait
+
+    - name: Print PM2 logs if app did not start
+      command: pm2 logs app --lines 100 --nostream
+      register: pm2_logs
+      when: port_wait is failed
+      become: yes
+      become_user: ubuntu
+      changed_when: false
+
+    - name: Show PM2 logs
+      debug:
+        msg: "{{ pm2_logs.stdout_lines | default(['No logs captured']) }}"
+      when: port_wait is failed
+
+    - name: Fail if app did not start
+      fail:
+        msg: >
+          App did not start on port {{ app_port }} within 120 seconds.
+          Check the PM2 logs above. Common causes: missing build step, crashed script, or mismatched port.
+      when: port_wait is failed
+
+    - name: Configure nginx reverse proxy
+      copy:
+        content: |
+          server {
+              listen 80;
+              server_name _;
+              location / {
+                  proxy_pass http://127.0.0.1:{{ app_port }};
+                  proxy_http_version 1.1;
+                  proxy_set_header Upgrade $http_upgrade;
+                  proxy_set_header Connection 'upgrade';
+                  proxy_set_header Host $host;
+                  proxy_cache_bypass $http_upgrade;
+              }
+          }
+        dest: /etc/nginx/sites-enabled/app
+        mode: '0644'
+
+    - name: Remove default nginx config
+      file:
+        path: /etc/nginx/sites-enabled/default
+        state: absent
+
+    - name: Restart nginx
+      service:
+        name: nginx
+        state: restarted
+        enabled: yes
+
+    - name: Report server IP
+      debug:
+        msg: "server_ip={{ ansible_host }}"
